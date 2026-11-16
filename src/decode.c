@@ -2816,7 +2816,7 @@ int dav1d_decode_frame_init(Dav1dFrameContext *const f) {
 
     const int n_ts = f->frame_hdr->tiling.cols * f->frame_hdr->tiling.rows;
     if (n_ts != f->n_ts) {
-        if (c->n_fc > 1) {
+        if (c->n_tc > 1) {
             dav1d_free(f->frame_thread.tile_start_off);
             f->frame_thread.tile_start_off =
                 dav1d_malloc(ALLOC_TILE, sizeof(*f->frame_thread.tile_start_off) * n_ts);
@@ -2834,7 +2834,7 @@ int dav1d_decode_frame_init(Dav1dFrameContext *const f) {
         f->n_ts = n_ts;
     }
 
-    const int a_sz = f->sb128w * f->frame_hdr->tiling.rows * (1 + (c->n_fc > 1 && c->n_tc > 1));
+    const int a_sz = f->sb128w * f->frame_hdr->tiling.rows * (1 + (c->n_tc > 1));
     if (a_sz != f->a_sz) {
         dav1d_free(f->a);
         f->a = dav1d_malloc(ALLOC_TILE, sizeof(*f->a) * a_sz);
@@ -2848,7 +2848,7 @@ int dav1d_decode_frame_init(Dav1dFrameContext *const f) {
     const int num_sb128 = f->sb128w * f->sb128h;
     const uint8_t *const size_mul = ss_size_mul[f->cur.p.layout];
     const int hbd = !!f->seq_hdr->hbd;
-    if (c->n_fc > 1) {
+    if (c->n_tc > 1) {
         const unsigned sb_step4 = f->sb_step * 4;
         int tile_idx = 0;
         for (int tile_row = 0; tile_row < f->frame_hdr->tiling.rows; tile_row++) {
@@ -3056,7 +3056,7 @@ int dav1d_decode_frame_init(Dav1dFrameContext *const f) {
             goto error;
         }
         f->lf.level[1] = (void*)((uint8_t*)f->lf.level[0] + level_bytes);
-        if (c->n_fc > 1) {
+        if (c->n_tc > 1) {
             dav1d_free(f->frame_thread.b);
             f->frame_thread.b = dav1d_malloc(ALLOC_BLOCK, sizeof(*f->frame_thread.b) *
                                              num_sb128 * 32 * 32);
@@ -3118,10 +3118,12 @@ int dav1d_decode_frame_init(Dav1dFrameContext *const f) {
 
     // init ref mvs
     if (IS_INTER_OR_SWITCH(f->frame_hdr) || f->frame_hdr->allow_intrabc) {
+        const int n_frame_threads = f->c->n_fc > 1 ? f->c->n_fc :
+                                    dav1d_uses_2pass(f->c) ? 2 : 1;
         const int ret =
             dav1d_refmvs_init_frame(&f->rf, f->seq_hdr, f->frame_hdr,
                                     f->refpoc, f->mvs, f->refrefpoc, f->ref_mvs,
-                                    f->c->n_tc, f->c->n_fc);
+                                    f->c->n_tc, n_frame_threads);
         if (ret < 0) goto error;
     }
 
@@ -3220,7 +3222,7 @@ int dav1d_decode_frame_init_cdf(Dav1dFrameContext *const f) {
             }
 
             setup_tile(&f->ts[j], f, data, tile_sz, tile_row, tile_col++,
-                       c->n_fc > 1 ? f->frame_thread.tile_start_off[j] : 0);
+                       dav1d_uses_2pass(c) ? f->frame_thread.tile_start_off[j] : 0);
 
             if (tile_col == f->frame_hdr->tiling.cols) {
                 tile_col = 0;
@@ -3234,7 +3236,7 @@ int dav1d_decode_frame_init_cdf(Dav1dFrameContext *const f) {
     }
 
     if (c->n_tc > 1) {
-        const int uses_2pass = c->n_fc > 1;
+        const int uses_2pass = dav1d_uses_2pass(c);
         for (int n = 0; n < f->sb128w * f->frame_hdr->tiling.rows * (1 + uses_2pass); n++)
             reset_context(&f->a[n], IS_KEY_OR_INTRA(f->frame_hdr),
                           uses_2pass ? 1 + (n >= f->sb128w * f->frame_hdr->tiling.rows) : 0);
@@ -3297,7 +3299,7 @@ void dav1d_decode_frame_exit(Dav1dFrameContext *const f, int retval) {
     if (f->sr_cur.p.data[0])
         atomic_init(&f->task_thread.error, 0);
 
-    if (c->n_fc > 1 && retval && f->frame_thread.cf) {
+    if (c->n_tc > 1 && retval && f->frame_thread.cf) {
         memset(f->frame_thread.cf, 0,
                (size_t)f->frame_thread.cf_sz * 128 * 128 / 2);
     }
@@ -3343,11 +3345,19 @@ int dav1d_decode_frame(Dav1dFrameContext *const f) {
     // wait until all threads have completed
     if (!res) {
         if (f->c->n_tc > 1) {
-            res = dav1d_task_create_tile_sbrow(f, 0, 1);
+            const int uses_2pass = dav1d_uses_2pass(f->c);
+            if (uses_2pass) {
+                res = dav1d_task_create_tile_sbrow(f, 1, 0);
+                if (!res)
+                    res = dav1d_task_create_tile_sbrow(f, 2, 0);
+            } else {
+                res = dav1d_task_create_tile_sbrow(f, 0, 1);
+            }
             pthread_mutex_lock(&f->task_thread.ttd->lock);
             pthread_cond_signal(&f->task_thread.ttd->cond);
             if (!res) {
                 while (!f->task_thread.done[0] ||
+                       (uses_2pass && !f->task_thread.done[1]) ||
                        atomic_load(&f->task_thread.task_counter) > 0)
                 {
                     pthread_cond_wait(&f->task_thread.cond,
@@ -3613,7 +3623,7 @@ int dav1d_submit_frame(Dav1dContext *const c) {
     f->b4_stride = (f->bw + 31) & ~31;
     f->bitdepth_max = (1 << f->cur.p.bpc) - 1;
     atomic_init(&f->task_thread.error, 0);
-    const int uses_2pass = c->n_fc > 1;
+    const int uses_2pass = dav1d_uses_2pass(c);
     const int cols = f->frame_hdr->tiling.cols;
     const int rows = f->frame_hdr->tiling.rows;
     atomic_store(&f->task_thread.task_counter,

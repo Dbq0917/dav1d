@@ -640,7 +640,7 @@ static COLD void close_internal(Dav1dContext **const c_out, int flush) {
         Dav1dFrameContext *const f = &c->fc[n];
 
         // clean-up threading stuff
-        if (c->n_fc > 1) {
+        if (c->n_tc > 1) {
             dav1d_free(f->tile_thread.lowest_pixel_mem);
             dav1d_free(f->frame_thread.b);
             dav1d_free_aligned(f->frame_thread.cbi);

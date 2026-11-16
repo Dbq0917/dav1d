@@ -220,7 +220,7 @@ static int create_filter_sbrow(Dav1dFrameContext *const f,
     const int has_lr = f->lf.restore_planes;
 
     Dav1dTask *tasks = f->task_thread.tasks;
-    const int uses_2pass = f->c->n_fc > 1;
+    const int uses_2pass = dav1d_uses_2pass(f->c);
     int num_tasks = f->sbh * (1 + uses_2pass);
     if (num_tasks > f->task_thread.num_tasks) {
         const size_t size = sizeof(Dav1dTask) * num_tasks;
@@ -269,7 +269,7 @@ int dav1d_task_create_tile_sbrow(Dav1dFrameContext *const f, const int pass,
                                  const int cond_signal)
 {
     Dav1dTask *tasks = f->task_thread.tile_tasks[0];
-    const int uses_2pass = f->c->n_fc > 1;
+    const int uses_2pass = dav1d_uses_2pass(f->c);
     const int n_tasks_per_pass = f->frame_hdr->tiling.cols * f->frame_hdr->tiling.rows;
     const int n_tasks = n_tasks_per_pass * (1 + uses_2pass);
     if (pass < 2) {
@@ -400,7 +400,7 @@ static inline int check_tile(Dav1dTask *const t, Dav1dFrameContext *const f,
     if (p1 < t->sby) return 1;
     int error = p1 == TILE_ERROR;
     error |= atomic_fetch_or(&f->task_thread.error, error);
-    if (!error && frame_mt && !tp) {
+    if (!error && !tp && dav1d_uses_2pass(f->c)) {
         const int p2 = atomic_load(&ts->progress[1]);
         if (p2 <= t->sby) return 1;
         error = p2 == TILE_ERROR;
@@ -738,7 +738,7 @@ void *dav1d_worker_task(void *data) {
 
             tc->ts = ts;
             tc->by = sby << f->sb_shift;
-            const int uses_2pass = c->n_fc > 1;
+            const int uses_2pass = dav1d_uses_2pass(c);
             tc->frame_thread.pass = !uses_2pass ? 0 :
                 1 + (t->type == DAV1D_TASK_TYPE_TILE_RECONSTRUCTION);
             if (!error) error = dav1d_decode_tile_sbrow(tc);
@@ -749,7 +749,7 @@ void *dav1d_worker_task(void *data) {
             if (((sby + 1) << f->sb_shift) < ts->tiling.row_end) {
                 t->sby++;
                 t->deps_skip = 0;
-                if (!check_tile(t, f, uses_2pass)) {
+                if (!check_tile(t, f, c->n_fc > 1)) {
                     atomic_store(&ts->progress[p], progress);
                     reset_task_cur_async(ttd, t->frame_idx, c->n_fc);
                     if (!atomic_fetch_or(&ttd->cond_signaled, 1))
@@ -853,15 +853,18 @@ void *dav1d_worker_task(void *data) {
         default: abort();
         }
         // if task completed [typically LR], signal picture progress as per below
-        const int uses_2pass = c->n_fc > 1;
+        const int uses_2pass = dav1d_uses_2pass(c);
         const int sbh = f->sbh;
         const int sbsz = f->sb_step * 4;
         if (t->type == DAV1D_TASK_TYPE_ENTROPY_PROGRESS) {
             error = atomic_load(&f->task_thread.error);
             const unsigned y = sby + 1 == sbh ? UINT_MAX : (unsigned)(sby + 1) * sbsz;
-            assert(c->n_fc > 1);
-            if (f->sr_cur.p.data[0] /* upon flush, this can be free'ed already */)
+            assert(c->n_tc > 1);
+            if (c->n_fc > 1 &&
+                f->sr_cur.p.data[0] /* upon flush, this can be free'ed already */)
+            {
                 atomic_store(&f->sr_cur.progress[0], error ? FRAME_ERROR : y);
+            }
             atomic_store(&f->frame_thread.entropy_progress,
                          error ? TILE_ERROR : sby + 1);
             if (sby + 1 == sbh)

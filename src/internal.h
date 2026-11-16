@@ -202,6 +202,12 @@ struct Dav1dContext {
     Dav1dMemPool *pic_ctx_pool;
 };
 
+static inline int dav1d_uses_2pass(const Dav1dContext *const c) {
+    // Worker threads can overlap entropy decoding and reconstruction even
+    // when frame threading is disabled for low-latency decoding.
+    return c->n_tc > 1;
+}
+
 struct Dav1dTask {
     unsigned frame_idx;         // frame thread id
     enum TaskType type;         // task work
